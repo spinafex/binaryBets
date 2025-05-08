@@ -1,89 +1,98 @@
-# 📥 Load and inspect CSV
+# 📦 Required libraries
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.interpolate import interp1d
+from scipy.stats import norm
 from scipy.integrate import quad
 
-df = pd.read_csv("xle.csv")
+# 📁 Load uploaded CSV with puts and calls
+puts = pd.read_csv("xli.csv")
 
-# 🧠 Extract Option Type and Expiration from 'Contract Name'
-df["Type"] = df["Contract Name"].str.extract(r'([CP])')
-df["Expiration"] = pd.to_datetime(df["Contract Name"].str.extract(r'(\d{6})')[0], format='%y%m%d')
+# 🧼 Normalize column names
+puts.columns = [col.strip() for col in puts.columns]
 
-# 🔍 Filter for July 18, 2025 PUT options
-puts = df[
-    (df["Type"] == "P") &
-    (df["Expiration"] == pd.Timestamp("2025-07-18"))
-].copy()
+# 🛠 Clean mid-price column
+def clean_mid_price(row):
+    bid = row["Bid"]
+    ask = row["Ask"]
+    if bid <= 0 or ask <= 0 or pd.isna(bid) or pd.isna(ask):
+        return np.nan
+    return (bid + ask) / 2
 
-# 🧮 Midpoint pricing
-puts["Mid"] = (puts["Bid"] + puts["Ask"]) / 2
-puts = puts[(puts["Mid"] > 0) & (puts["Strike"] > 0)].sort_values("Strike")
+puts["Mid"] = puts.apply(clean_mid_price, axis=1)
 
-# 🎯 Define strikes for the vertical put spread
-strike_low = 70
-strike_high = 75
+# Drop rows with no valid mid
+puts = puts.dropna(subset=["Mid"])
+
+# 🎯 Define spread
+strike_high = 30  # Long put
+strike_low = 25   # Short put
 spread_width = strike_high - strike_low
-max_payout = spread_width
+T = (pd.to_datetime("2025-07-18") - pd.Timestamp.today()).days / 365  # time to expiry
 
-# 🎯 Market price of spread (long 75P, short 70P)
-price_high_put = float(puts.loc[puts["Strike"] == strike_high, "Mid"].values[0])
-price_low_put = float(puts.loc[puts["Strike"] == strike_low, "Mid"].values[0])
-market_price = price_high_put - price_low_put
+# 📊 Estimate implied volatility for the long leg (could average both)
+def get_iv(strike_target):
+    row = puts[np.isclose(puts["Strike"], strike_target, atol=0.05)]
+    if not row.empty:
+        iv_str = row["Implied Volatility"].values[0]
+        return float(str(iv_str).strip('%')) / 100
+    raise ValueError(f"No IV found for strike {strike_target}")
 
-# 🔧 Interpolation
-put_interp = interp1d(puts["Strike"], puts["Mid"], kind="linear", fill_value="extrapolate")
+iv = get_iv(strike_high)
 
-# 📘 Second derivative
-def second_derivative(f, x, h=0.25):
-    return (f(x + h) - 2*f(x) + f(x - h)) / h**2
+# 🧮 Estimate forward price from OTM options near the money
+def estimate_forward_price():
+    # Estimate from ATM puts and calls if available (not perfect but good enough)
+    strikes = puts["Strike"].unique()
+    atm_strike = min(strikes, key=lambda x: abs(x - strike_high))
+    return atm_strike  # crude proxy for S0
 
-# 📘 Risk-neutral PDF
-def pdf(K):
-    val = second_derivative(put_interp, K)
-    return max(0, second_derivative(put_interp, K))
+S0 = estimate_forward_price()
 
-# 💸 Payoff function
+# 🧠 Black-Scholes PDF under risk-neutral measure
+def bs_pdf(ST, S0, T, sigma):
+    if ST <= 0:
+        return 0
+    mu = np.log(S0)
+    denom = ST * sigma * np.sqrt(2 * np.pi * T)
+    exponent = - (np.log(ST / S0))**2 / (2 * sigma**2 * T)
+    return (1 / denom) * np.exp(exponent)
+
+# 📈 Payoff function for long 75/70 put spread
 def payoff(ST):
     return max(0, strike_high - ST) - max(0, strike_low - ST)
 
-# 🧮 Integration domain
-K_vals = np.linspace(40, 90, 500)
-pdf_vals = [pdf(k) for k in K_vals]
-payoff_vals = [payoff(k) for k in K_vals]
-
-# 📊 Plot PDF and Payoff
-plt.figure(figsize=(10, 5))
-plt.subplot(1, 2, 1)
-plt.plot(K_vals, pdf_vals)
-plt.title("Implied Risk-Neutral PDF")
-plt.xlabel("Price at Expiry")
-plt.ylabel("Density")
-plt.grid(True)
-
-plt.subplot(1, 2, 2)
-plt.plot(K_vals, payoff_vals, color="orange")
-plt.title("Payoff: Long 75/70 Put Spread")
-plt.xlabel("Price at Expiry")
-plt.ylabel("Payoff")
-plt.grid(True)
-
-plt.tight_layout()
-plt.show()
-
-# 📐 Calculate Probability ITM (ST < 75)
+# 🔍 Probability the spread finishes ITM
+pdf = lambda ST: bs_pdf(ST, S0, T, iv)
 prob_ITM, _ = quad(lambda ST: pdf(ST) if payoff(ST) > 0 else 0, 0.01, strike_high)
-
-# 🎯 Probability of Max Payout (ST <= 70)
 prob_max, _ = quad(lambda ST: pdf(ST), 0.01, strike_low)
 
-# 💰 Expected Value (risk-neutral)
+# 💰 Expected Value under risk-neutral distribution
 EV, _ = quad(lambda ST: payoff(ST) * pdf(ST), 0.01, 100)
 
-# 📢 Final report
-print(f"📌 Probability the spread finishes ITM (ST < {strike_high}): {prob_ITM:.2%}")
-print(f"📌 Probability of max payout (${max_payout}, ST ≤ {strike_low}): {prob_max:.2%}")
+# 🧾 Retrieve spread market price with fallback logic
+def get_put_price_fallback(strike_target):
+    row = puts[np.isclose(puts["Strike"], strike_target, atol=0.05)]
+    if not row.empty:
+        mid = row["Mid"].values[0]
+        if not np.isnan(mid):
+            return float(mid)
+        else:
+            return float(row["Last Price"].values[0])
+    else:
+        raise ValueError(f"Strike {strike_target} not found in puts")
+
+price_high_put = get_put_price_fallback(strike_high)
+price_low_put = get_put_price_fallback(strike_low)
+market_price = price_high_put - price_low_put
+
+# 📊 Results
+print(f"📌 Underlying (proxy S0): ${S0:.2f}")
+print(f"📌 Implied Volatility (75P): {iv:.2%}")
+print(f"📌 Days to Expiration: {T*365:.0f}")
+print(f"📌 Probability the spread finishes ITM (ST < 75): {prob_ITM:.2%}")
+print(f"📌 Probability of max payout (${spread_width}, ST ≤ 70): {prob_max:.2%}")
 print(f"📌 Expected Value under risk-neutral PDF: ${EV:.2f}")
 print(f"📌 Market Price of Spread (mid): ${market_price:.2f}")
 print(f"📌 Fair Value Difference (EV - Market): ${EV - market_price:.2f}")
+

@@ -1,0 +1,76 @@
+# 🛠 Install dependencies
+!pip install numpy scipy matplotlib pandas --quiet
+
+# 📥 Import libraries
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.interpolate import interp1d
+from scipy.integrate import quad
+from datetime import datetime
+
+# 📂 Load uploaded CSV
+puts_full = pd.read_csv("xle.csv")
+
+# 🔍 Filter for July 2025 expiration puts
+puts = puts_full[
+    (puts_full["Type"].str.lower() == "put") &
+    (puts_full["Expiration"].str.contains("2025-07-18"))
+].copy()
+
+# 💡 Check for expected columns (adjust if needed)
+print("Columns available:", puts.columns)
+
+# ⚙️ Calculate mid prices
+puts["Mid"] = (puts["Bid"] + puts["Ask"]) / 2
+puts = puts[(puts["Mid"] > 0) & (puts["Strike"] > 0)].sort_values("Strike")
+
+# 🎯 Define parameters for the put spread
+strike_low = 70
+strike_high = 75
+
+# 📉 Interpolation
+put_interp = interp1d(puts["Strike"], puts["Mid"], kind="cubic", fill_value="extrapolate")
+
+# 📘 Second derivative using finite differences
+def second_derivative(f, x, h=0.5):
+    return (f(x + h) - 2*f(x) + f(x - h)) / h**2
+
+# 📘 Implied risk-neutral PDF
+def pdf(K):
+    return max(0, second_derivative(put_interp, K))
+
+# 🧮 Payoff for long 75/70 put spread
+def payoff(ST):
+    return max(0, strike_high - ST) - max(0, strike_low - ST)
+
+# 📊 Evaluation range
+K_vals = np.linspace(0.1, 100, 1000)
+pdf_vals = [pdf(k) for k in K_vals]
+payoff_vals = [payoff(k) for k in K_vals]
+
+# 📊 Plot PDF and payoff
+plt.figure(figsize=(10, 5))
+plt.subplot(1, 2, 1)
+plt.plot(K_vals, pdf_vals, label="Implied PDF")
+plt.title("Implied Risk-Neutral PDF")
+plt.xlabel("Price at Expiry")
+plt.ylabel("Probability Density")
+plt.grid(True)
+
+plt.subplot(1, 2, 2)
+plt.plot(K_vals, payoff_vals, color="orange", label="Payoff")
+plt.title("Payoff: Long 75/70 Put Spread")
+plt.xlabel("Price at Expiry")
+plt.ylabel("Payoff")
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# 📐 Integrate PDF over payoff > 0
+def integrand(ST):
+    return pdf(ST) if payoff(ST) > 0 else 0
+
+prob_ITM, _ = quad(integrand, 0.01, 75)
+
+print(f"📌 Implied Probability Long XLE July 2025 75/70 Put Spread finishes ITM: {prob_ITM:.2%}")

@@ -1,0 +1,89 @@
+# 📥 Load and inspect CSV
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.interpolate import interp1d
+from scipy.integrate import quad
+
+df = pd.read_csv("xle.csv")
+
+# 🧠 Extract Option Type and Expiration from 'Contract Name'
+df["Type"] = df["Contract Name"].str.extract(r'([CP])')
+df["Expiration"] = pd.to_datetime(df["Contract Name"].str.extract(r'(\d{6})')[0], format='%y%m%d')
+
+# 🔍 Filter for July 18, 2025 PUT options
+puts = df[
+    (df["Type"] == "P") &
+    (df["Expiration"] == pd.Timestamp("2025-07-18"))
+].copy()
+
+# 🧮 Midpoint pricing
+puts["Mid"] = (puts["Bid"] + puts["Ask"]) / 2
+puts = puts[(puts["Mid"] > 0) & (puts["Strike"] > 0)].sort_values("Strike")
+
+# 🎯 Define strikes for the vertical put spread
+strike_low = 70
+strike_high = 75
+spread_width = strike_high - strike_low
+max_payout = spread_width
+
+# 🎯 Market price of spread (long 75P, short 70P)
+price_high_put = float(puts.loc[puts["Strike"] == strike_high, "Mid"].values[0])
+price_low_put = float(puts.loc[puts["Strike"] == strike_low, "Mid"].values[0])
+market_price = price_high_put - price_low_put
+
+# 🔧 Interpolation
+put_interp = interp1d(puts["Strike"], puts["Mid"], kind="linear", fill_value="extrapolate")
+
+# 📘 Second derivative
+def second_derivative(f, x, h=0.25):
+    return (f(x + h) - 2*f(x) + f(x - h)) / h**2
+
+# 📘 Risk-neutral PDF
+def pdf(K):
+    val = second_derivative(put_interp, K)
+    return max(0, second_derivative(put_interp, K))
+
+# 💸 Payoff function
+def payoff(ST):
+    return max(0, strike_high - ST) - max(0, strike_low - ST)
+
+# 🧮 Integration domain
+K_vals = np.linspace(40, 90, 500)
+pdf_vals = [pdf(k) for k in K_vals]
+payoff_vals = [payoff(k) for k in K_vals]
+
+# 📊 Plot PDF and Payoff
+plt.figure(figsize=(10, 5))
+plt.subplot(1, 2, 1)
+plt.plot(K_vals, pdf_vals)
+plt.title("Implied Risk-Neutral PDF")
+plt.xlabel("Price at Expiry")
+plt.ylabel("Density")
+plt.grid(True)
+
+plt.subplot(1, 2, 2)
+plt.plot(K_vals, payoff_vals, color="orange")
+plt.title("Payoff: Long 75/70 Put Spread")
+plt.xlabel("Price at Expiry")
+plt.ylabel("Payoff")
+plt.grid(True)
+
+plt.tight_layout()
+plt.show()
+
+# 📐 Calculate Probability ITM (ST < 75)
+prob_ITM, _ = quad(lambda ST: pdf(ST) if payoff(ST) > 0 else 0, 0.01, strike_high)
+
+# 🎯 Probability of Max Payout (ST <= 70)
+prob_max, _ = quad(lambda ST: pdf(ST), 0.01, strike_low)
+
+# 💰 Expected Value (risk-neutral)
+EV, _ = quad(lambda ST: payoff(ST) * pdf(ST), 0.01, 100)
+
+# 📢 Final report
+print(f"📌 Probability the spread finishes ITM (ST < {strike_high}): {prob_ITM:.2%}")
+print(f"📌 Probability of max payout (${max_payout}, ST ≤ {strike_low}): {prob_max:.2%}")
+print(f"📌 Expected Value under risk-neutral PDF: ${EV:.2f}")
+print(f"📌 Market Price of Spread (mid): ${market_price:.2f}")
+print(f"📌 Fair Value Difference (EV - Market): ${EV - market_price:.2f}")
